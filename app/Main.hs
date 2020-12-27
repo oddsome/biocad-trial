@@ -193,7 +193,7 @@ getWholeReactionSlow rId = do
 getWholeReaction :: Int -> IO ([Molecule], (Catalyst, ACCELERATE), Reaction, [(Molecule, PRODUCT_FROM)])
 getWholeReaction rId = do
     gs <- runQueryDB $ getGraph $ matchWholeReactionG rId
-    print gs
+    
     let mIns@[_,_]     = extractNode     "mIns" <$> gs
     let (reaction:_)   = extractNode     "reaction" <$> gs
     let (catalyst:_)   = extractNode     "catalyst" <$> gs
