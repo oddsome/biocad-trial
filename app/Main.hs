@@ -11,8 +11,8 @@ module Main where
 
 import Lib
 
-import Data.Map (member, fromList, toList, (!))
-import Data.List (zipWith4)
+import Data.Map (Map, filterWithKey, unionWith, empty, member, fromList, toList, (!))
+import Data.List (zipWith4, foldl')
 import Data.Text (Text, pack)
 import Data.Maybe (fromJust)
 import Data.Default
@@ -104,17 +104,17 @@ generateTestData from howMuch = flip evalStateT from $ do
 putTestData :: IO [[Graph NodeName BoltId BoltId]]
 putTestData = do
         (mIns, cas, rs, pFs) <- generateTestData 0 50
-        mapM (runQueryDB . putGraph) $ zipWith4 addWholeReactionQ mIns cas rs pFs
+        sequence $ zipWith4 putWholeReaction mIns cas rs pFs
 
 
 
 -- напишите функцию, которая умеет принимать реацию на вход и загружать её в базу
-addWholeReactionQ :: [Molecule] -> 
+addWholeReactionG :: [Molecule] -> 
                     (Catalyst, ACCELERATE) ->
                     Reaction ->
                     [(Molecule, PRODUCT_FROM)] ->
                     State GraphPutRequest ()
-addWholeReactionQ mIns (catalyst, accelerate) reaction (unzip -> (mOuts, product_froms)) = do 
+addWholeReactionG mIns (catalyst, accelerate) reaction (unzip -> (mOuts, product_froms)) = do 
         newNode reaction
 
         newNode catalyst
@@ -143,23 +143,23 @@ putWholeReaction :: [Molecule] ->
                Reaction ->
                [(Molecule, PRODUCT_FROM)] ->
                IO [Graph NodeName (NodeRes PutRequest) (RelRes PutRequest)]
-putWholeReaction mIns cas reaction mOutsPfs = runQueryDB $ putGraph $ addWholeReactionQ mIns cas reaction mOutsPfs
+putWholeReaction mIns cas reaction mOutsPfs = runQueryDB $ putGraph $ addWholeReactionG mIns cas reaction mOutsPfs
 
 
 
 -- напишите функцию, которая по номеру реакции в базе будет возвращать её в Haskell-объект
-matchWholeReaction :: Int -> State GraphGetRequest ()
-matchWholeReaction rId = do
-        getNode "reaction" ''Reaction $ withProp ("id", I rId)
+matchWholeReactionG :: Int -> State GraphGetRequest ()
+matchWholeReactionG rId = do
+        getNode "reaction"            ''Reaction $ withProp ("id", I rId)
         
-        getNode "mIns"     ''Molecule plain
+        getNode "mIns"                ''Molecule        plain
         modify $ addRelation "mIns" "reaction" $ defaultRelNotReturn # withLabelQ ''REAGENT_IN
 
-        getNode "catalyst" ''Catalyst plain
-        getRel "reaction" "catalyst" ''ACCELERATE plain
+        getNode "catalyst"            ''Catalyst        plain
+        getRel  "reaction" "catalyst" ''ACCELERATE      plain
 
-        getNode "mOuts"    ''Molecule plain
-        getRel  "mOuts" "reaction" ''PRODUCT_FROM plain
+        getNode "mOuts"               ''Molecule        plain
+        getRel  "mOuts" "reaction"    ''PRODUCT_FROM    plain
     where
         plain = Prelude.id
 
@@ -175,18 +175,36 @@ matchWholeReaction rId = do
             withReturn allProps #
             params
 
+-- боллее медленная, но приятно выглядящая версия
+getWholeReactionSlow :: Int -> IO ([Molecule], (Catalyst, ACCELERATE), Reaction, [(Molecule, PRODUCT_FROM)])
+getWholeReactionSlow rId = do
+    (mergeG -> g) <- runQueryDB $ getGraph $ matchWholeReactionG rId
+
+    let mIns@[_,_]   = extractNodes     "mIns" g
+    let [reaction]   = extractNodes     "reaction" g
+    let [catalyst]   = extractNodes     "catalyst" g
+    let [accelerate] = extractRelations "catalyst" "reaction" g
+    let mOuts@[_]    = extractNodes     "mOuts" g
+    let pFs@[_]      = extractRelations "reaction" "mOuts" g
+
+    pure (mIns, (catalyst, accelerate), reaction, zip mOuts pFs)
+
+-- обычная версия
 getWholeReaction :: Int -> IO ([Molecule], (Catalyst, ACCELERATE), Reaction, [(Molecule, PRODUCT_FROM)])
 getWholeReaction rId = do
-    g <- runQueryDB $ getGraph $ matchWholeReaction rId
-    
-    let mIns@[_,_]           :: [Molecule]     = extractNode     "mIns" <$> g
-    let (head -> reaction)   :: [Reaction]     = extractNode     "reaction" <$> g
-    let (head -> catalyst)   :: [Catalyst]     = extractNode     "catalyst" <$> g
-    let (head -> accelerate) :: [ACCELERATE]   = extractRelation "catalyst" "reaction" <$> g
-    let (head -> mOuts)      :: [Molecule]     = extractNode     "mOuts" <$> g
-    let (head -> pFs)        :: [PRODUCT_FROM] = extractRelation "reaction" "mOuts" <$> g
+    gs <- runQueryDB $ getGraph $ matchWholeReactionG rId
+    print gs
+    let mIns@[_,_]     = extractNode     "mIns" <$> gs
+    let (reaction:_)   = extractNode     "reaction" <$> gs
+    let (catalyst:_)   = extractNode     "catalyst" <$> gs
+    let (accelerate:_) = extractRelation "catalyst" "reaction" <$> gs
+    let (mOut:_)       = extractNode     "mOuts" <$> gs
+    let (pF:_)         = extractRelation "reaction" "mOuts" <$> gs
 
-    pure (mIns, (catalyst, accelerate), reaction, [(mOuts, pFs)])
+    pure (mIns, (catalyst, accelerate), reaction, [(mOut, pF)])
+-- можно было матчить mIn1, mIn2 ... раздельно в построении графа запроса, но я подумал что таким путем
+-- будет труднее обобщить до переменного числа исходных молекул, например
+-- поэтому либо так, либо как выше, с мержом графов в один, где вершины и отношения - мультимапа
 
 
 
@@ -197,7 +215,7 @@ getShortestPath mFrom mTo = do
         pure $ unpack <$> res
     where
         unpack = fromJust . exactMaybe @Path . flip (!) "p"
-        
+
         asCypher m = toCypher $ NodeSelector Nothing (labels m) (toList $ getProps m) []
 
         getShortestPathQ :: Node -> Node -> Text
@@ -214,13 +232,13 @@ main = do
     -- put/get reaction
     let (mOut : mIns) = [Molecule 700 "test1a" "test1b",
                          Molecule 701 "test2a" "test2b",
-                         Molecule 703 "test3a" "test4b"]
+                         Molecule 702 "test3a" "test3b"]
     pf <- generate $ arbitrary @PRODUCT_FROM
-    let catalyst = Catalyst 704 "test4a" Nothing
+    let catalyst = Catalyst 703 "test4a" Nothing
     acc <- generate $ arbitrary @ACCELERATE
-    let reaction = Reaction 705 "test5a"
+    let reaction = Reaction 704 "test5a"
     putWholeReaction mIns (catalyst, acc) reaction [(mOut, pf)]
-    res <- getWholeReaction 705
+    res <- getWholeReaction 704
     print res
 
     -- get shortest path
@@ -244,7 +262,7 @@ main = do
 getMoleculebyId :: Int -> IO Molecule
 getMoleculebyId id = do
     res <- runQueryDB $ getGraph $ getMByIDQ id
-    let (head -> resMol) :: [Molecule] = extractNode "m" <$> res
+    let [resMol] :: [Molecule] = extractNode "m" <$> res
     pure resMol
     where
         getMByIDQ :: Int -> State GraphGetRequest ()
